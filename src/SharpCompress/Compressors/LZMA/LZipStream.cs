@@ -22,8 +22,18 @@ public sealed partial class LZipStream : Stream, IFinishable
 {
     private readonly Stream _stream;
     private readonly CountingStream? _countingWritableSubStream;
+    private readonly CountingStream? _countingReadableSubStream;
+    private readonly uint[]? _crc32Table;
+    private readonly ulong? _expectedDataSize;
+    private readonly ulong? _expectedMemberSize;
+    private readonly bool _skipTrailerValidation;
     private bool _disposed;
     private bool _finished;
+    private bool _trailerValidated;
+    private uint _seed = Crc32Stream.DEFAULT_SEED;
+    private ulong _readCount;
+    private readonly long _memberStartPosition;
+    private readonly long _compressedDataStartPosition;
 
     private long _writeCount;
     private readonly Stream? _originalStream;
@@ -37,13 +47,43 @@ public sealed partial class LZipStream : Stream, IFinishable
 
         if (mode == CompressionMode.Decompress)
         {
+            _skipTrailerValidation = stream is SharpCompressStream;
+            _memberStartPosition = stream.CanSeek ? stream.Position : 0;
             var dSize = ValidateAndReadSize(stream);
             if (dSize == 0)
             {
                 throw new InvalidFormatException("Not an LZip stream");
             }
             var properties = GetProperties(dSize);
-            _stream = LzmaStream.Create(properties, stream, leaveOpen: leaveOpen);
+            var trailerStream = GetSeekableTrailerStream(stream);
+            if (trailerStream is not null)
+            {
+                var position = trailerStream.Position;
+                trailerStream.Position = trailerStream.Length - 16;
+                Span<byte> sizeTrailer = stackalloc byte[16];
+                trailerStream.ReadFully(sizeTrailer);
+                _expectedDataSize = BinaryPrimitives.ReadUInt64LittleEndian(sizeTrailer);
+                _expectedMemberSize = BinaryPrimitives.ReadUInt64LittleEndian(sizeTrailer[8..]);
+                if (_expectedDataSize > long.MaxValue)
+                {
+                    throw new InvalidFormatException("LZip data size is too large.");
+                }
+                trailerStream.Position = position;
+            }
+            _compressedDataStartPosition = stream.CanSeek ? stream.Position : 0;
+            _countingReadableSubStream = new CountingStream(
+                SharpCompressStream.CreateNonDisposing(stream)
+            );
+            _crc32Table = Crc32Stream.InitializeTable(Crc32Stream.DEFAULT_POLYNOMIAL);
+            _stream = LzmaStream.Create(
+                properties,
+                _countingReadableSubStream,
+                inputSize: -1,
+                outputSize: _expectedDataSize.HasValue
+                    ? checked((long)_expectedDataSize.Value)
+                    : -1,
+                leaveOpen: leaveOpen
+            );
         }
         else
         {
@@ -106,7 +146,7 @@ public sealed partial class LZipStream : Stream, IFinishable
         {
             Finish();
             _stream.Dispose();
-            if (Mode == CompressionMode.Compress && !_leaveOpen)
+            if (!_leaveOpen)
             {
                 _originalStream?.Dispose();
             }
@@ -134,10 +174,29 @@ public sealed partial class LZipStream : Stream, IFinishable
         set => throw new NotImplementedException();
     }
 
-    public override int Read(byte[] buffer, int offset, int count) =>
-        _stream.Read(buffer, offset, count);
+    public override int Read(byte[] buffer, int offset, int count)
+    {
+        var read = _stream.Read(buffer, offset, count);
+        UpdateAndValidateAtEof(buffer.AsSpan(offset, read), read);
+        return read;
+    }
 
-    public override int ReadByte() => _stream.ReadByte();
+    public override int ReadByte()
+    {
+        var value = _stream.ReadByte();
+        if (value == -1)
+        {
+            ValidateTrailer();
+        }
+        else
+        {
+            Span<byte> buffer = stackalloc byte[1];
+            buffer[0] = (byte)value;
+            UpdateChecksum(buffer);
+        }
+
+        return value;
+    }
 
     public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
 
@@ -145,7 +204,12 @@ public sealed partial class LZipStream : Stream, IFinishable
 
 #if !LEGACY_DOTNET
 
-    public override int Read(Span<byte> buffer) => _stream.Read(buffer);
+    public override int Read(Span<byte> buffer)
+    {
+        var read = _stream.Read(buffer);
+        UpdateAndValidateAtEof(buffer[..read], read);
+        return read;
+    }
 
     public override void Write(ReadOnlySpan<byte> buffer)
     {
@@ -246,4 +310,130 @@ public sealed partial class LZipStream : Stream, IFinishable
             (byte)((dictionarySize >> 16) & 0xff),
             (byte)((dictionarySize >> 24) & 0xff),
         ];
+
+    private static Stream? GetSeekableTrailerStream(Stream stream)
+    {
+        while (stream is SharpCompressStream { IsPassthrough: true } sharpCompressStream)
+        {
+            stream = sharpCompressStream.BaseStream();
+        }
+
+        if (stream is SeekableSharpCompressStream seekableSharpCompressStream)
+        {
+            stream = seekableSharpCompressStream.BaseStream();
+        }
+
+        return stream is SharpCompressStream ? null
+            : stream.CanSeek ? stream
+            : null;
+    }
+
+    private static Stream? GetPhysicalSeekableStream(Stream stream)
+    {
+        while (stream is SharpCompressStream sharpCompressStream)
+        {
+            var baseStream = sharpCompressStream.BaseStream();
+            if (ReferenceEquals(baseStream, stream) || !baseStream.CanSeek)
+            {
+                break;
+            }
+
+            stream = baseStream;
+        }
+
+        return stream.CanSeek ? stream : null;
+    }
+
+    private static bool IsProbeWrapper(Stream stream) =>
+        stream is SharpCompressStream { IsPassthrough: true } sharpCompressStream
+        && sharpCompressStream.BaseStream() is SharpCompressStream { IsPassthrough: false };
+
+    private void UpdateAndValidateAtEof(ReadOnlySpan<byte> buffer, int read)
+    {
+        if (Mode != CompressionMode.Decompress)
+        {
+            return;
+        }
+
+        if (read > 0)
+        {
+            UpdateChecksum(buffer);
+            return;
+        }
+
+        ValidateTrailer();
+    }
+
+    private void UpdateChecksum(ReadOnlySpan<byte> buffer)
+    {
+        _seed = Crc32Stream.CalculateCrc(_crc32Table.NotNull(), _seed, buffer);
+        _readCount += (ulong)buffer.Length;
+    }
+
+    private void ValidateTrailer()
+    {
+        if (_trailerValidated || _skipTrailerValidation || Mode != CompressionMode.Decompress)
+        {
+            return;
+        }
+
+        _trailerValidated = true;
+
+        var countingStream = _countingReadableSubStream.NotNull();
+        ulong? compressedDataSize = null;
+        Span<byte> trailer = stackalloc byte[20];
+        if (_expectedMemberSize.HasValue && countingStream.CanSeek)
+        {
+            compressedDataSize = _expectedMemberSize.Value - 26;
+            countingStream.Position = _compressedDataStartPosition + (long)compressedDataSize.Value;
+            countingStream.ReadFully(trailer);
+        }
+        else if (GetPhysicalSeekableStream(countingStream.WrappedStream) is { } trailerStream)
+        {
+            var position = trailerStream.Position;
+            trailerStream.Position = trailerStream.Length - 20;
+            trailerStream.ReadFully(trailer);
+            trailerStream.Position = position;
+        }
+        else
+        {
+            compressedDataSize = _stream is LzmaStream lzmaStream
+                ? (ulong)lzmaStream.CompressedBytesRead
+                : (ulong)countingStream.BytesRead;
+            if (countingStream.CanSeek)
+            {
+                countingStream.Position =
+                    _compressedDataStartPosition + (long)compressedDataSize.Value;
+            }
+            countingStream.ReadFully(trailer);
+        }
+
+        var expectedCrc = BinaryPrimitives.ReadUInt32LittleEndian(trailer);
+        var expectedDataSize = BinaryPrimitives.ReadUInt64LittleEndian(trailer[4..]);
+        var expectedMemberSize = BinaryPrimitives.ReadUInt64LittleEndian(trailer[12..]);
+
+        var actualCrc = ~_seed;
+        if (actualCrc != expectedCrc)
+        {
+            throw new InvalidFormatException(
+                $"LZip CRC mismatch. Expected 0x{expectedCrc:X8}, actual 0x{actualCrc:X8}."
+            );
+        }
+
+        if (_readCount != expectedDataSize)
+        {
+            throw new InvalidFormatException(
+                $"LZip data size mismatch. Expected {expectedDataSize}, actual {_readCount}."
+            );
+        }
+
+        var actualMemberSize = compressedDataSize ?? expectedMemberSize - 26;
+        actualMemberSize += 26;
+        if (actualMemberSize != expectedMemberSize)
+        {
+            throw new InvalidFormatException(
+                $"LZip member size mismatch. Expected {expectedMemberSize}, actual {actualMemberSize}."
+            );
+        }
+    }
 }

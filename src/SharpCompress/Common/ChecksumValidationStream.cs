@@ -13,6 +13,7 @@ internal sealed class ChecksumValidationStream : Stream
     private readonly string _entryName;
     private readonly uint[] _crc32Table;
     private uint _seed = Crc32Stream.DEFAULT_SEED;
+    private ushort _crc16;
     private bool _validated;
 
     internal ChecksumValidationStream(Stream stream, ChecksumDescriptor checksum, string? entryName)
@@ -64,7 +65,7 @@ internal sealed class ChecksumValidationStream : Stream
         }
         else
         {
-            _seed = Crc32Stream.CalculateCrc(_crc32Table, _seed, (byte)value);
+            UpdateChecksum([(byte)value]);
         }
 
         return value;
@@ -107,11 +108,25 @@ internal sealed class ChecksumValidationStream : Stream
     {
         if (read > 0)
         {
-            _seed = Crc32Stream.CalculateCrc(_crc32Table, _seed, buffer);
+            UpdateChecksum(buffer);
             return;
         }
 
         Validate();
+    }
+
+    private void UpdateChecksum(ReadOnlySpan<byte> buffer)
+    {
+        switch (_checksum.Kind)
+        {
+            case ChecksumKind.Crc32:
+            case ChecksumKind.Crc32NoFinalXor:
+                _seed = Crc32Stream.CalculateCrc(_crc32Table, _seed, buffer);
+                break;
+            case ChecksumKind.Crc16Arc:
+                _crc16 = CalculateCrc16Arc(_crc16, buffer);
+                break;
+        }
     }
 
     private void Validate()
@@ -123,12 +138,23 @@ internal sealed class ChecksumValidationStream : Stream
 
         _validated = true;
 
-        if (_checksum.Kind != ChecksumKind.Crc32)
+        switch (_checksum.Kind)
         {
-            return;
+            case ChecksumKind.Crc32:
+                ValidateCrc32(finalXor: true);
+                break;
+            case ChecksumKind.Crc32NoFinalXor:
+                ValidateCrc32(finalXor: false);
+                break;
+            case ChecksumKind.Crc16Arc:
+                ValidateCrc16Arc();
+                break;
         }
+    }
 
-        var actual = ~_seed;
+    private void ValidateCrc32(bool finalXor)
+    {
+        var actual = finalXor ? ~_seed : _seed;
         var expected = unchecked((uint)_checksum.ExpectedValue);
         if (actual != expected)
         {
@@ -136,5 +162,30 @@ internal sealed class ChecksumValidationStream : Stream
                 $"CRC mismatch for entry '{_entryName}'. Expected 0x{expected:X8}, actual 0x{actual:X8}."
             );
         }
+    }
+
+    private void ValidateCrc16Arc()
+    {
+        var expected = unchecked((ushort)_checksum.ExpectedValue);
+        if (_crc16 != expected)
+        {
+            throw new InvalidFormatException(
+                $"CRC mismatch for entry '{_entryName}'. Expected 0x{expected:X4}, actual 0x{_crc16:X4}."
+            );
+        }
+    }
+
+    private static ushort CalculateCrc16Arc(ushort crc, ReadOnlySpan<byte> buffer)
+    {
+        foreach (var value in buffer)
+        {
+            crc ^= value;
+            for (var i = 0; i < 8; i++)
+            {
+                crc = (crc & 1) != 0 ? (ushort)((crc >> 1) ^ 0xA001) : (ushort)(crc >> 1);
+            }
+        }
+
+        return crc;
     }
 }

@@ -513,4 +513,6 @@ public partial class LzmaStream : Stream, IStreamStack, IAsyncDisposable
     }
 
     public byte[] Properties { get; } = new byte[5];
+
+    internal long CompressedBytesRead => _inputPosition;
 }

@@ -21,6 +21,13 @@ public class ArjEntry : Entry
 
     public override long Crc => _filePart.Header.OriginalCrc32;
 
+    internal override ChecksumDescriptor Checksum =>
+        !IsDirectory
+        && _filePart.Header.CompressionMethod != CompressionMethod.NoDataNoCrc
+        && _filePart.Header.CompressionMethod != CompressionMethod.NoData
+            ? new ChecksumDescriptor(ChecksumKind.Crc32, _filePart.Header.OriginalCrc32, true)
+            : default;
+
     public override string? Key => _filePart?.Header.Name;
 
     public override string? LinkTarget => null;

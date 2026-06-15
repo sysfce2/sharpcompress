@@ -32,6 +32,11 @@ public class ArcEntry : Entry
         }
     }
 
+    internal override ChecksumDescriptor Checksum =>
+        _filePart is not null && _filePart.Header.CompressionMethod != CompressionType.Unknown
+            ? new ChecksumDescriptor(ChecksumKind.Crc16Arc, _filePart.Header.Crc16, true)
+            : default;
+
     public override string? Key => _filePart?.Header.Name;
 
     public override string? LinkTarget => null;

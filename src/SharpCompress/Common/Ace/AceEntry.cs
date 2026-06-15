@@ -31,6 +31,14 @@ public class AceEntry : Entry
         }
     }
 
+    internal override ChecksumDescriptor Checksum =>
+        !IsDirectory
+        && !IsEncrypted
+        && !_filePart.Header.IsContinuedFromPrev
+        && !_filePart.Header.IsContinuedToNext
+            ? new ChecksumDescriptor(ChecksumKind.Crc32NoFinalXor, _filePart.Header.Crc32, true)
+            : default;
+
     public override string? Key => _filePart?.Header.Filename;
 
     public override string? LinkTarget => null;
