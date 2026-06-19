@@ -132,6 +132,15 @@ using (var archive = ZipArchive.OpenArchive("file.zip"))
     var firstEntry = archive.Entries.First();
     firstEntry.WriteToFile(@"C:\output\file.txt");
 
+    // Extract single entry to a stream with extraction options
+    using (var outputStream = File.Create(@"C:\output\file.txt"))
+    {
+        firstEntry.WriteTo(
+            outputStream,
+            new ExtractionOptions { CheckCrc = false }
+        );
+    }
+
     // Get entry stream
     using (var stream = entry.OpenEntryStream())
     {
@@ -154,6 +163,15 @@ await using (var asyncArchive = await ZipArchive.OpenAsyncArchive("file.zip"))
 {
     await foreach (var entry in asyncArchive.EntriesAsync)
     {
+        await using (var outputStream = File.Create(@"C:\output\" + entry.Key))
+        {
+            await entry.WriteToAsync(
+                outputStream,
+                new ExtractionOptions { CheckCrc = false },
+                cancellationToken: cancellationToken
+            );
+        }
+
         using (var stream = await entry.OpenEntryStreamAsync(cancellationToken))
         {
             // ...
@@ -320,7 +338,11 @@ var flatOptions = ExtractionOptions.FlatExtract;  // No directory structure
 var metadataOptions = ExtractionOptions.PreserveMetadata; // Keep timestamps and attributes
 
 // Tune extraction copy buffering
-var extractionOptions = new ExtractionOptions { BufferSize = 131072 };
+var extractionOptions = new ExtractionOptions
+{
+    BufferSize = 131072,
+    CheckCrc = true, // Default: validate entry checksums when archive metadata provides one
+};
 
 // Factory defaults:
 // - file path / FileInfo overloads use LeaveStreamOpen = false
@@ -429,7 +451,8 @@ var options = new ExtractionOptions
 {
     ExtractFullPath = true,                         // Recreate directory structure
     Overwrite = true,                               // Overwrite existing files
-    PreserveFileTime = true                         // Keep original timestamps
+    PreserveFileTime = true,                        // Keep original timestamps
+    CheckCrc = true                                 // Validate payload checksums when available
 };
 
 using (var archive = ZipArchive.OpenArchive("file.zip"))
@@ -437,6 +460,8 @@ using (var archive = ZipArchive.OpenArchive("file.zip"))
     archive.WriteToDirectory(@"C:\output", options);
 }
 ```
+
+`CheckCrc` validates archive-level payload checksums when the format stores reliable metadata, such as ZIP CRC32 values. Formats without payload checksums skip this validation. Decompressor integrity checks that are required to decode a stream may still fail even when `CheckCrc` is disabled.
 
 ### Options matrix
 

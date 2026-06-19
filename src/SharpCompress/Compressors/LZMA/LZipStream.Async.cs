@@ -169,7 +169,7 @@ public sealed partial class LZipStream
     public override ValueTask<int> ReadAsync(
         Memory<byte> buffer,
         CancellationToken cancellationToken = default
-    ) => _stream.ReadAsync(buffer, cancellationToken);
+    ) => ReadAndValidateAsync(buffer, cancellationToken);
 #endif
 
     /// <summary>
@@ -180,7 +180,33 @@ public sealed partial class LZipStream
         int offset,
         int count,
         CancellationToken cancellationToken = default
-    ) => _stream.ReadAsync(buffer, offset, count, cancellationToken);
+    ) => ReadAndValidateAsync(buffer, offset, count, cancellationToken);
+
+    private async Task<int> ReadAndValidateAsync(
+        byte[] buffer,
+        int offset,
+        int count,
+        CancellationToken cancellationToken
+    )
+    {
+        var read = await _stream
+            .ReadAsync(buffer, offset, count, cancellationToken)
+            .ConfigureAwait(false);
+        UpdateAndValidateAtEof(buffer.AsSpan(offset, read), read);
+        return read;
+    }
+
+#if !LEGACY_DOTNET
+    private async ValueTask<int> ReadAndValidateAsync(
+        Memory<byte> buffer,
+        CancellationToken cancellationToken
+    )
+    {
+        var read = await _stream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+        UpdateAndValidateAtEof(buffer.Span[..read], read);
+        return read;
+    }
+#endif
 
     /// <summary>
     /// Asynchronously writes bytes from a buffer to the current stream.

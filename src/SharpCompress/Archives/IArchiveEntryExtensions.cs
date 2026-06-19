@@ -18,11 +18,24 @@ public static class IArchiveEntryExtensions
         /// <param name="streamToWriteTo">The stream to write the entry content to.</param>
         /// <param name="progress">Optional progress reporter for tracking extraction progress.</param>
         public void WriteTo(Stream streamToWriteTo, IProgress<ProgressReport>? progress = null) =>
-            archiveEntry.WriteTo(streamToWriteTo, null, progress);
+            archiveEntry.WriteTo(streamToWriteTo, bufferSize: null, progress: progress);
+
+        /// <summary>
+        /// Extract entry to the specified stream.
+        /// </summary>
+        /// <param name="streamToWriteTo">The stream to write the entry content to.</param>
+        /// <param name="options">Options for configuring extraction behavior.</param>
+        /// <param name="progress">Optional progress reporter for tracking extraction progress.</param>
+        public void WriteTo(
+            Stream streamToWriteTo,
+            ExtractionOptions options,
+            IProgress<ProgressReport>? progress = null
+        ) => archiveEntry.WriteTo(streamToWriteTo, options.BufferSize, options, progress);
 
         private void WriteTo(
             Stream streamToWriteTo,
             int? bufferSize,
+            ExtractionOptions? options = null,
             IProgress<ProgressReport>? progress = null
         )
         {
@@ -32,7 +45,10 @@ public static class IArchiveEntryExtensions
             }
 
             using var entryStream = archiveEntry.OpenEntryStream();
-            var sourceStream = WrapWithProgress(entryStream, archiveEntry, progress);
+            var checkedStream = options is null
+                ? entryStream
+                : IEntryExtensions.WrapWithChecksumValidation(archiveEntry, entryStream, options);
+            var sourceStream = WrapWithProgress(checkedStream, archiveEntry, progress);
             sourceStream.CopyTo(streamToWriteTo, bufferSize ?? Constants.BufferSize);
         }
 
@@ -46,16 +62,43 @@ public static class IArchiveEntryExtensions
             Stream streamToWriteTo,
             IProgress<ProgressReport>? progress = null,
             CancellationToken cancellationToken = default
-        )
-        {
+        ) =>
             await archiveEntry
-                .WriteToAsync(streamToWriteTo, Constants.BufferSize, progress, cancellationToken)
+                .WriteToAsync(
+                    streamToWriteTo,
+                    Constants.BufferSize,
+                    progress: progress,
+                    cancellationToken: cancellationToken
+                )
                 .ConfigureAwait(false);
-        }
+
+        /// <summary>
+        /// Extract entry to the specified stream asynchronously.
+        /// </summary>
+        /// <param name="streamToWriteTo">The stream to write the entry content to.</param>
+        /// <param name="options">Options for configuring extraction behavior.</param>
+        /// <param name="progress">Optional progress reporter for tracking extraction progress.</param>
+        /// <param name="cancellationToken">Cancellation token.</param>
+        public async ValueTask WriteToAsync(
+            Stream streamToWriteTo,
+            ExtractionOptions options,
+            IProgress<ProgressReport>? progress = null,
+            CancellationToken cancellationToken = default
+        ) =>
+            await archiveEntry
+                .WriteToAsync(
+                    streamToWriteTo,
+                    options.BufferSize,
+                    options,
+                    progress,
+                    cancellationToken
+                )
+                .ConfigureAwait(false);
 
         private async ValueTask WriteToAsync(
             Stream streamToWriteTo,
             int? bufferSize,
+            ExtractionOptions? options = null,
             IProgress<ProgressReport>? progress = null,
             CancellationToken cancellationToken = default
         )
@@ -74,7 +117,10 @@ public static class IArchiveEntryExtensions
                 .OpenEntryStreamAsync(cancellationToken)
                 .ConfigureAwait(false);
 #endif
-            var sourceStream = WrapWithProgress(entryStream, archiveEntry, progress);
+            var checkedStream = options is null
+                ? entryStream
+                : IEntryExtensions.WrapWithChecksumValidation(archiveEntry, entryStream, options);
+            var sourceStream = WrapWithProgress(checkedStream, archiveEntry, progress);
             await sourceStream
                 .CopyToAsync(streamToWriteTo, bufferSize ?? Constants.BufferSize, cancellationToken)
                 .ConfigureAwait(false);
@@ -154,13 +200,14 @@ public static class IArchiveEntryExtensions
         /// </summary>
         public void WriteToFile(string destinationFileName, ExtractionOptions? options = null)
         {
+            options ??= new ExtractionOptions();
             entry.WriteEntryToFile(
                 destinationFileName,
                 options,
                 (x, fm) =>
                 {
                     using var fs = File.Open(x, fm);
-                    entry.WriteTo(fs, options?.BufferSize ?? Constants.BufferSize);
+                    entry.WriteTo(fs, options?.BufferSize ?? Constants.BufferSize, options, null);
                 }
             );
         }
@@ -172,7 +219,9 @@ public static class IArchiveEntryExtensions
             string destinationFileName,
             ExtractionOptions? options = null,
             CancellationToken cancellationToken = default
-        ) =>
+        )
+        {
+            options ??= new ExtractionOptions();
             await entry
                 .WriteEntryToFileAsync(
                     destinationFileName,
@@ -181,11 +230,12 @@ public static class IArchiveEntryExtensions
                     {
                         using var fs = File.Open(x, fm);
                         await entry
-                            .WriteToAsync(fs, options?.BufferSize, null, ct)
+                            .WriteToAsync(fs, options.BufferSize, options, null, ct)
                             .ConfigureAwait(false);
                     },
                     cancellationToken
                 )
                 .ConfigureAwait(false);
+        }
     }
 }

@@ -277,9 +277,9 @@ public partial class LzmaStream : Stream, IStreamStack, IAsyncDisposable
             {
                 _inputPosition += _outWindow.CopyStream(_inputStream, toProcess);
             }
-            else if (_decoder!.Code(_dictionarySize, _outWindow, _rangeDecoder) && _outputSize < 0)
+            else if (_decoder!.Code(_dictionarySize, _outWindow, _rangeDecoder))
             {
-                _availableBytes = _outWindow.AvailableBytes;
+                HandleEndMarker();
             }
 
             var read = _outWindow.Read(buffer, offset, toProcess);
@@ -290,6 +290,11 @@ public partial class LzmaStream : Stream, IStreamStack, IAsyncDisposable
 
             if (_availableBytes == 0 && !_uncompressedChunk)
             {
+                if (_isLzma2 && _decoder!.HasEndMarker)
+                {
+                    throw new DataErrorException();
+                }
+
                 // Check range corruption scenario
                 if (
                     !_rangeDecoder.IsFinished
@@ -368,9 +373,9 @@ public partial class LzmaStream : Stream, IStreamStack, IAsyncDisposable
         {
             _inputPosition += _outWindow.CopyStream(_inputStream, 1);
         }
-        else if (_decoder!.Code(_dictionarySize, _outWindow, _rangeDecoder) && _outputSize < 0)
+        else if (_decoder!.Code(_dictionarySize, _outWindow, _rangeDecoder))
         {
-            _availableBytes = _outWindow.AvailableBytes;
+            HandleEndMarker();
         }
 
         var value = _outWindow.ReadByte();
@@ -379,6 +384,11 @@ public partial class LzmaStream : Stream, IStreamStack, IAsyncDisposable
 
         if (_availableBytes == 0 && !_uncompressedChunk)
         {
+            if (_isLzma2 && _decoder!.HasEndMarker)
+            {
+                throw new DataErrorException();
+            }
+
             // Check range corruption scenario
             if (
                 !_rangeDecoder.IsFinished
@@ -413,6 +423,11 @@ public partial class LzmaStream : Stream, IStreamStack, IAsyncDisposable
 
         if (control == 0x00)
         {
+            if (_isLzma2 && _decoder is { HasEndMarker: true })
+            {
+                throw new DataErrorException();
+            }
+
             _endReached = true;
             return;
         }
@@ -472,6 +487,19 @@ public partial class LzmaStream : Stream, IStreamStack, IAsyncDisposable
         }
     }
 
+    private void HandleEndMarker()
+    {
+        if (_isLzma2)
+        {
+            throw new DataErrorException();
+        }
+
+        if (_outputSize < 0)
+        {
+            _availableBytes = _outWindow.AvailableBytes;
+        }
+    }
+
     public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
 
     public override void SetLength(long value) => throw new NotSupportedException();
@@ -485,4 +513,6 @@ public partial class LzmaStream : Stream, IStreamStack, IAsyncDisposable
     }
 
     public byte[] Properties { get; } = new byte[5];
+
+    internal long CompressedBytesRead => _inputPosition;
 }

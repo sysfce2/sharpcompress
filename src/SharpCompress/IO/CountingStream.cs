@@ -6,17 +6,25 @@ using System.Threading.Tasks;
 namespace SharpCompress.IO;
 
 /// <summary>
-/// A simple stream wrapper that counts bytes written without buffering.
+/// A simple stream wrapper that counts bytes read and written without buffering.
 /// </summary>
 internal class CountingStream : Stream
 {
     private readonly Stream _stream;
+    private long _bytesRead;
     private long _bytesWritten;
 
     public CountingStream(Stream stream)
     {
         _stream = stream ?? throw new ArgumentNullException(nameof(stream));
     }
+
+    internal Stream WrappedStream => _stream;
+
+    /// <summary>
+    /// Gets the total number of bytes read from this stream.
+    /// </summary>
+    public long BytesRead => _bytesRead;
 
     /// <summary>
     /// Gets the total number of bytes written to this stream.
@@ -42,8 +50,32 @@ internal class CountingStream : Stream
     public override async Task FlushAsync(CancellationToken cancellationToken) =>
         await _stream.FlushAsync(cancellationToken).ConfigureAwait(false);
 
-    public override int Read(byte[] buffer, int offset, int count) =>
-        _stream.Read(buffer, offset, count);
+    public override int Read(byte[] buffer, int offset, int count)
+    {
+        var read = _stream.Read(buffer, offset, count);
+        _bytesRead += read;
+        return read;
+    }
+
+    public override int ReadByte()
+    {
+        var value = _stream.ReadByte();
+        if (value != -1)
+        {
+            _bytesRead++;
+        }
+
+        return value;
+    }
+
+#if !LEGACY_DOTNET
+    public override int Read(Span<byte> buffer)
+    {
+        var read = _stream.Read(buffer);
+        _bytesRead += read;
+        return read;
+    }
+#endif
 
     public override long Seek(long offset, SeekOrigin origin) => _stream.Seek(offset, origin);
 
@@ -72,7 +104,31 @@ internal class CountingStream : Stream
         _bytesWritten += count;
     }
 
+    public override async Task<int> ReadAsync(
+        byte[] buffer,
+        int offset,
+        int count,
+        CancellationToken cancellationToken
+    )
+    {
+        var read = await _stream
+            .ReadAsync(buffer, offset, count, cancellationToken)
+            .ConfigureAwait(false);
+        _bytesRead += read;
+        return read;
+    }
+
 #if !LEGACY_DOTNET
+    public override async ValueTask<int> ReadAsync(
+        Memory<byte> buffer,
+        CancellationToken cancellationToken = default
+    )
+    {
+        var read = await _stream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+        _bytesRead += read;
+        return read;
+    }
+
     public override async ValueTask WriteAsync(
         ReadOnlyMemory<byte> buffer,
         CancellationToken cancellationToken = default
